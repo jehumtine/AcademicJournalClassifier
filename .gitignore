@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.env
+*.venv
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Data files
+*.csv
+*.tsv
+*.xlsx
+*.db
+
+# Test outputs
+htmlcov/
+coverage.xml
+*.cover
+
+# System files
+Thumbs.db
+
+# Environment variables
+.env
+.env.*
+
+# PyCharm
+.idea/
+
+# Raw Data
+pdfs/
