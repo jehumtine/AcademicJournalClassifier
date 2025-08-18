@@ -26,7 +26,6 @@ dist/
 *.log
 
 # Data files
-*.csv
 *.tsv
 *.xlsx
 *.db
