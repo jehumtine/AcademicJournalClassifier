@@ -66,3 +66,121 @@ Achieving this baseline will:
 - Demonstrate that the model performs significantly above random guessing
 - Provide policymakers and researchers with a usable starting point for tracking sectoral research contributions
 - Establish a functional foundation for refining the system toward higher accuracy and more adoption
+
+# Model Training (leak-proof & reproducible)
+
+
+## 4.1 Split first, then fit (no leakage)
+
+Always split before any fitting or vectorizing.
+
+```python
+from sklearn.model_selection import train_test_split
+X_text = df["combined_text"]
+y      = df["query_sector"]
+
+X_tr, X_te, y_tr, y_te = train_test_split(
+    X_text, y, test_size=0.20, stratify=y, random_state=42
+)
+```
+
+## 4.2 End-to-end Pipeline (sparse, scalable)
+
+Keep TF-IDF and feature scaling inside a single `Pipeline` to avoid leakage, ensure deployability, and preserve sparsity.
+
+```python
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.svm import LinearSVC   # or LogisticRegression
+import numpy as np
+
+num_cols = ["title_length","abstract_length","total_text_length",
+            "published_year","publication_decade","has_doi","has_pdf"]
+cat_cols = ["source","journal","provenance_sources","main_topic"]
+
+pre = ColumnTransformer(
+    transformers=[
+        ("text", TfidfVectorizer(max_features=5000, min_df=2, max_df=0.8, ngram_range=(1,2)), "combined_text"),
+        ("num",  StandardScaler(with_mean=False), num_cols),
+        ("cat",  OneHotEncoder(handle_unknown="ignore"), cat_cols),
+    ],
+    sparse_threshold=1.0,  # keep it sparse
+    remainder="drop"
+)
+
+svm_clf = Pipeline(steps=[
+    ("prep", pre),
+    ("clf",  LinearSVC(C=1.0, class_weight="balanced", max_iter=5000))
+])
+
+logreg_clf = Pipeline(steps=[
+    ("prep", pre),
+    ("clf",  LogisticRegression(max_iter=200, multi_class="multinomial",
+                                solver="saga", class_weight="balanced"))
+])
+```
+
+> **When to use which**
+>
+> * **LinearSVC**: fast, strong with high-dim TF-IDF; **no probabilities** (use `CalibratedClassifierCV` if you need them).
+> * **LogisticRegression**: competitive baseline, gives calibrated probabilities out of the box.
+
+## 4.3 Train & evaluate (accuracy isn’t enough)
+
+Track macro/weighted F1 for class imbalance; show a confusion matrix.
+
+```python
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+svm_clf.fit(pd.DataFrame({"combined_text": X_tr}).assign(**df.loc[X_tr.index, num_cols+cat_cols]), y_tr)
+y_pr = svm_clf.predict(pd.DataFrame({"combined_text": X_te}).assign(**df.loc[X_te.index, num_cols+cat_cols]))
+
+print("Accuracy:", accuracy_score(y_te, y_pr))
+print(classification_report(y_te, y_pr, digits=3))
+# Optional viz: confusion matrix heatmap
+```
+
+**Minimum bar**: meet or beat the baseline in the project’s success criteria and prioritize **macro-F1** for fairness across sectors.&#x20;
+
+## 4.4 Hyperparameters worth tuning
+
+* **TF-IDF**: `max_features` (3k–20k), `ngram_range` ((1,1) vs (1,2)), `min_df`, `max_df`
+* **LinearSVC**: `C` (0.1–10), `max_iter` (≥5000)
+* **LogReg**: `C` (0.1–10), `penalty='l2'`, `class_weight`
+  Use **stratified CV**; report mean ± std of macro-F1.
+
+## 4.5 Persistence (ship one artifact)
+
+Save the **entire pipeline** so preprocessing + model stay in sync.
+
+```python
+import joblib
+joblib.dump(svm_clf, "vision2030_linear_svm_pipeline.pkl")
+# or
+joblib.dump(logreg_clf, "vision2030_logreg_pipeline.pkl")
+```
+
+## 4.6 Inference (single call)
+
+```python
+pipe = joblib.load("vision2030_linear_svm_pipeline.pkl")
+new = pd.DataFrame([{
+  "combined_text": "<title> ... </title> <abstract> ...",
+  **{k: v for k,v in engineered_numeric_and_cats.items()}
+}])
+pred = pipe.predict(new)[0]
+```
+
+## 4.7 Gaps we’ve closed
+
+* **Leakage**: vectorizers/encoders now fit on **train only** (inside Pipeline).
+* **Scaling**: numeric features standardized to play nice with TF-IDF magnitudes.
+* **Categoricals**: one-hot encoded (no fake ordinality from label encoding).
+* **Sparsity**: no `.toarray()`; memory stays tame.
+* **Imbalance**: `class_weight='balanced'` + macro-F1 reporting.
+* **Convergence**: boosted `max_iter` for LinearSVC.
+* **Reproducibility**: fixed `random_state`; recommend logging library versions.
+
+> one line of steel: **Split early, pipeline everything, tune `C`, report macro-F1, and save the pipeline.**
