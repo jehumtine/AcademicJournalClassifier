@@ -49,3 +49,6 @@ Thumbs.db
 
 # Raw Data
 pdfs/
+
+#Include the following
+!vision2030_corpus.csv

@@ -6,3 +6,4 @@ nltk
 requests
 beautifulsoup4
 joblib
+seaborn
