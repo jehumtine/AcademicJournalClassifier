@@ -240,3 +240,253 @@ Move TF-IDF + encoders + scaling into a single Pipeline trained on train only.
 Tune C and max_iter, try class_weight="balanced" if imbalance hurts minority recall.
 
 If you need probabilities for ranking: CalibratedClassifierCV or switch to multinomial LogisticRegression.
+
+Deployment
+6.1 Artifacts needed
+
+Make sure these exist (produced in training/evaluation):
+
+../data/model_linear_svc.pkl              # trained LinearSVC
+../data/target_encoder.pkl                # LabelEncoder for target classes
+../data/label_encoders.pkl                # dict of LabelEncoders for cats
+../data/tfidf_vectorizer.pkl              # TF-IDF vectorizer (if used)
+../data/feature_order.json                # list of final feature column names (save this from training)
+
+
+If you didn’t save feature_order.json earlier, export it once from the training notebook:
+
+import json, os
+os.makedirs("../data", exist_ok=True)
+with open("../data/feature_order.json", "w") as f:
+    json.dump(list(final_features.columns), f)
+
+6.2 Inference utilities (local)
+
+Create predict.py:
+
+# predict.py
+import os, json, joblib, argparse
+import numpy as np
+import pandas as pd
+
+NUMERIC = ['title_length','abstract_length','total_text_length',
+           'published_year','publication_decade','has_doi','has_pdf']
+CAT_KEYS = ['source','journal','provenance_sources','main_topic']  # adjust to your project
+TOPIC_PREFIX = 'topic_'
+
+def load_artifacts(data_dir="../data"):
+    model = joblib.load(os.path.join(data_dir, "model_linear_svc.pkl"))
+    tgt = joblib.load(os.path.join(data_dir, "target_encoder.pkl"))
+    cats = joblib.load(os.path.join(data_dir, "label_encoders.pkl"))
+    tfidf = joblib.load(os.path.join(data_dir, "tfidf_vectorizer.pkl"))
+    with open(os.path.join(data_dir, "feature_order.json")) as f:
+        feat_order = json.load(f)
+    return model, tgt, cats, tfidf, feat_order
+
+# minimal text preproc consistent with training
+import re
+try:
+    from nltk.stem import WordNetLemmatizer
+    from nltk.corpus import stopwords
+    STOP = set(stopwords.words("english"))
+    LEM  = WordNetLemmatizer()
+except Exception:
+    STOP, LEM = set(), None
+
+def preprocess_text(s: str) -> str:
+    if not isinstance(s, str): s = ""
+    s = s.lower()
+    s = re.sub(r"[^a-z\s]", " ", s)
+    tokens = [t for t in s.split() if len(t) > 2 and t not in STOP]
+    if LEM:
+        tokens = [LEM.lemmatize(t) for t in tokens]
+    return " ".join(tokens)
+
+def build_features(payload: dict, tfidf, cats: dict, feat_order: list) -> pd.DataFrame:
+    # text block
+    title = preprocess_text(payload.get("title",""))
+    abstract = preprocess_text(payload.get("abstract",""))
+    combined = f"{title} {abstract}"
+    X_text = tfidf.transform([combined])
+    tfidf_df = pd.DataFrame.sparse.from_spmatrix(X_text, columns=tfidf.get_feature_names_out())
+
+    # numeric block
+    num_vals = {k: payload.get(k, 0) for k in NUMERIC}
+    num_df = pd.DataFrame([num_vals])
+
+    # cat block (label-encode with fallbacks)
+    enc_vals = {}
+    for k in CAT_KEYS:
+        v = str(payload.get(k, "Unknown"))
+        if k in cats:
+            le = cats[k]
+            if v in le.classes_:
+                enc_vals[f"{k}_encoded"] = int(le.transform([v])[0])
+            else:
+                # fallback: map to 'Unknown' if present, else 0
+                if "Unknown" in le.classes_:
+                    enc_vals[f"{k}_encoded"] = int(le.transform(["Unknown"])[0])
+                else:
+                    enc_vals[f"{k}_encoded"] = 0
+        else:
+            enc_vals[f"{k}_encoded"] = 0
+    enc_df = pd.DataFrame([enc_vals])
+
+    # topic_* one-hots if provided
+    topics = payload.get("topics", []) or []
+    topic_cols = {f"{TOPIC_PREFIX}{t}": 1 for t in topics}
+    topic_df = pd.DataFrame([topic_cols])
+
+    # combine & align
+    X = pd.concat([num_df, enc_df, tfidf_df, topic_df], axis=1)
+    X = X.reindex(columns=feat_order, fill_value=0)
+    return X
+
+def top_k_from_margins(margins: np.ndarray, classes: list, k: int = 3):
+    idx = np.argsort(-margins)[:k]
+    return [{"label": classes[i], "margin": float(margins[i])} for i in idx]
+
+def predict(payloads, k=3, data_dir="../data"):
+    model, tgt, cats, tfidf, feat_order = load_artifacts(data_dir)
+    single = isinstance(payloads, dict)
+    payloads = [payloads] if single else payloads
+
+    results = []
+    for p in payloads:
+        X = build_features(p, tfidf, cats, feat_order)
+        pred_id = int(model.predict(X)[0])
+        label = tgt.inverse_transform([pred_id])[0]
+        margins = model.decision_function(X)
+        if margins.ndim == 2:
+            margins = margins[0]
+        topk = top_k_from_margins(margins, list(tgt.classes_), k)
+        results.append({"prediction": label, "topk": topk})
+    return results[0] if single else results
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", help="Path to JSON file with a list of records")
+    ap.add_argument("--title", default="")
+    ap.add_argument("--abstract", default="")
+    ap.add_argument("--topk", type=int, default=3)
+    args = ap.parse_args()
+
+    if args.json:
+        data = json.load(open(args.json))
+        out = predict(data, k=args.topk)
+    else:
+        out = predict({"title": args.title, "abstract": args.abstract}, k=args.topk)
+    print(json.dumps(out, indent=2))
+
+
+Usage:
+
+# single
+python predict.py --title "Maize yield..." --abstract "We study rainfall shocks..."
+# batch
+python predict.py --json samples.json --topk 5
+
+6.3 FastAPI microservice
+
+Create app.py:
+
+# app.py
+import time, os
+from typing import List, Optional
+from fastapi import FastAPI
+from pydantic import BaseModel
+from predict import predict  # reuses loaders/builders
+
+APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
+DATA_DIR    = os.getenv("DATA_DIR", "../data")
+
+class Item(BaseModel):
+    title: str = ""
+    abstract: str = ""
+    source: Optional[str] = None
+    journal: Optional[str] = None
+    provenance_sources: Optional[str] = None
+    main_topic: Optional[str] = None
+    published_year: Optional[int] = None
+    publication_decade: Optional[int] = None
+    has_doi: Optional[int] = 0
+    has_pdf: Optional[int] = 0
+    topics: Optional[List[str]] = None
+
+app = FastAPI(title="Vision2030 Classifier", version=APP_VERSION)
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": APP_VERSION}
+
+@app.post("/predict")
+def do_predict(items: List[Item]):
+    t0 = time.time()
+    payloads = [i.dict() for i in items]
+    out = predict(payloads, k=3, data_dir=DATA_DIR)
+    return {"predictions": out, "latency_ms": round((time.time()-t0)*1000, 2)}
+
+
+Run locally:
+
+pip install fastapi uvicorn pydantic
+uvicorn app:app --host 0.0.0.0 --port 8000
+# POST to http://localhost:8000/predict with a JSON array of Item
+
+6.4 Docker (optional)
+
+requirements.txt (pin as needed):
+
+fastapi
+uvicorn
+pydantic
+pandas
+numpy
+scikit-learn
+joblib
+nltk
+
+
+Dockerfile:
+
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-fetch NLTK data if your preproc uses it
+RUN python - <<'PY'
+import nltk
+nltk.download('stopwords', quiet=True)
+nltk.download('wordnet', quiet=True)
+PY
+
+COPY . .
+EXPOSE 8000
+ENV DATA_DIR=/app/data APP_VERSION=1.0.0
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+Build & run:
+
+docker build -t vision2030-classifier:1.0.0 .
+docker run -p 8000:8000 -v %cd%/data:/app/data vision2030-classifier:1.0.0
+
+6.5 Post-deploy checks
+
+/health returns {"status":"ok"} and version.
+
+/predict returns prediction and topk margins; labels match target_encoder.classes_.
+
+Log the model hash (e.g., SHA256 of model_linear_svc.pkl) and feature_order.json length on startup.
+
+6.6 Notes & limits
+
+No probabilities from LinearSVC; margins only. If you must have calibrated probabilities, retrain with CalibratedClassifierCV or switch to multinomial LogisticRegression.
+
+Strict column order: always reindex to feature_order.json. Any new topics or unseen categories become zeros or “Unknown”.
