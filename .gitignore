@@ -51,4 +51,4 @@ Thumbs.db
 pdfs/
 
 #Include the following
-!vision2030_corpus.csv
+!unza_labelled_schema.csv
