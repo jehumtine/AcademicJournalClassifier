@@ -184,3 +184,59 @@ pred = pipe.predict(new)[0]
 * **Reproducibility**: fixed `random_state`; recommend logging library versions.
 
 > one line of steel: **Split early, pipeline everything, tune `C`, report macro-F1, and save the pipeline.**
+
+Evaluation
+5.1 What this stage does
+
+Evaluates the Linear SVM on the engineered feature set:
+
+Computes accuracy, full classification report, confusion matrix.
+
+Adds weighted P/R/F1, per-class accuracy, and a confidence (margin) histogram.
+
+Prints train vs test accuracy and the generalization gap.
+
+Assembles an evaluation_results dictionary for downstream logging/exports.
+
+5.2 How to run
+
+Ensure you’ve already generated and saved:
+
+../data/processed_features.csv, ../data/target.csv, ../data/cleaned_dataset.csv
+
+../data/label_encoders.pkl, ../data/target_encoder.pkl, and (optionally) ../data/tfidf_vectorizer.pkl
+
+Open the notebook, run all cells in order (A → C).
+(If you see port/kernel issues in VS Code, select the .venv interpreter and the academic-journal kernel.)
+
+5.3 Recommended persistence (add to the last cell if you want files)
+import os, json, joblib
+os.makedirs("../data", exist_ok=True)
+
+# Save the trained model (optional here if you trained inline)
+joblib.dump(svm, "../data/model_linear_svc.pkl")
+
+# Save the detailed classification report too
+from sklearn.metrics import classification_report
+report = classification_report(y_test, y_pred, target_names=target_names, output_dict=True)
+
+evaluation_results.update({"report": report})
+with open("../data/evaluation_results.json", "w") as f:
+    json.dump(evaluation_results, f, indent=2)
+print("[INFO] Saved model_linear_svc.pkl and evaluation_results.json")
+
+5.4 Interpreting results (fast)
+
+Macro-F1 (add it if not printed yet) treats classes equally; use it alongside weighted F1.
+
+Confusion matrix: normalize by true class when diagnosing systematic confusion.
+
+Generalization gap: large positive gap ⇒ likely overfit; revisit features/regularization.
+
+5.5 Next steps (optional but wise)
+
+Move TF-IDF + encoders + scaling into a single Pipeline trained on train only.
+
+Tune C and max_iter, try class_weight="balanced" if imbalance hurts minority recall.
+
+If you need probabilities for ranking: CalibratedClassifierCV or switch to multinomial LogisticRegression.
